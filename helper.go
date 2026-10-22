@@ -3,6 +3,7 @@ package gjwt
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/gogf/gf/v2/errors/gcode"
@@ -23,6 +24,11 @@ const (
 func ExtractToken(headerValue, queryValue string) (string, error) {
 	headerValue = strings.TrimSpace(headerValue)
 	if headerValue != "" {
+		// 只有 "Bearer" 单词本身（前缀后无 token）同样视为无法识别的格式：
+		// 不修复的话它会走下方裸 token 分支被原样返回，碰巧在验签处失败，语义路径不干净
+		if strings.EqualFold(headerValue, bearerPrefix) {
+			return "", ErrTokenInvalid
+		}
 		if strings.Contains(headerValue, " ") {
 			parts := strings.SplitN(headerValue, " ", 2)
 			if strings.EqualFold(parts[0], bearerPrefix) && strings.TrimSpace(parts[1]) != "" {
@@ -122,20 +128,45 @@ func (a *Auth[C]) Middleware() ghttp.HandlerFunc {
 	}
 }
 
-// mapExtractError 把 token 提取阶段的错误翻译为配置中的错误：
-// header 有值但格式非法（如 "Basic xxx"）应报 invalid 而非 missing，语义才准确。
+// mapExtractError 把 token 提取阶段的错误翻译为配置中的错误（统一包装成 mappedError，
+// 语义类别打上 missing 标记）：header 有值但格式非法（如 "Basic xxx"）应报 invalid 而非 missing，
+// 语义才准确；错误链保留提取阶段的原始错误，与验签路径的行为一致。
 func (a *Auth[C]) mapExtractError(err error) error {
 	if errors.Is(err, ErrTokenInvalid) {
-		return a.cfg.errors.TokenInvalid
+		return &mappedError{
+			configured: a.cfg.errors.TokenInvalid,
+			cause:      err,
+			msg:        a.cfg.errors.TokenInvalid.Error(),
+		}
 	}
-	return a.cfg.errors.TokenMissing
+	return &mappedError{
+		configured: a.cfg.errors.TokenMissing,
+		cause:      err,
+		msg:        a.cfg.errors.TokenMissing.Error(),
+		missing:    true,
+	}
 }
 
 // reject 中止请求并把鉴权错误交由外层响应中间件统一包装（gf 标准流程）。
 // 错误携带 gerror 错误码（用户可用 gerror.NewCode 自定义），
 // 响应体格式（如 SoybeanAdmin 的 msg 字段）由业务侧自定义的响应中间件控制。
 // 不调用 r.Middleware.Next() 且直接 return 即为 GoFrame 中间件的中止方式。
+//
+// RFC 6750：状态码为 401 时必须携带 WWW-Authenticate: Bearer 响应头，
+// 标准 HTTP 客户端据此区分"未携带凭证"与"携带了但无效"：
+//   - 未携带 token（missing）→ "Bearer"（无 error 参数）
+//   - 携带了但无效/过期      → `Bearer error="invalid_token"`（RFC 6750 未定义 expired，统一归入 invalid_token）
+//
+// httpStatus 被配置为 200 等非 401 值时不携带该头（该头只在 401 语境下有意义）。
 func (a *Auth[C]) reject(r *ghttp.Request, err error) {
+	if a.cfg.httpStatus == http.StatusUnauthorized {
+		var me *mappedError
+		if errors.As(err, &me) && !me.missing {
+			r.Response.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		} else {
+			r.Response.Header().Set("WWW-Authenticate", "Bearer")
+		}
+	}
 	r.Response.WriteHeader(a.cfg.httpStatus)
 	r.SetError(err)
 }

@@ -25,6 +25,11 @@ const minSecretLen = 32
 // Errors 是可被业务覆盖的错误集合：三个场景各一个错误，
 // 用 gerror.NewCode(gcode.New(自定义码, "", nil), "提示语") 传入即可适配任意前端的错误码约定。
 // 只覆盖需要的字段，未设置的保持库默认值（统一为 401）。
+//
+// 重要：字段虽然声明为 error，但必须传入 gerror.NewCode 构造的错误实例。
+// 若传入普通错误（如 errors.New），mappedError.Code() 会得到 CodeNil，
+// gf 的 MiddlewareHandlerResponse 随即把它替换为 CodeInternalError（码 50），
+// 出现"HTTP 401 + body code 50"的自相矛盾响应。
 type Errors struct {
 	TokenMissing error // 请求中未携带 token
 	TokenInvalid error // 验签失败 / 格式非法 / 算法不在白名单
@@ -41,6 +46,8 @@ func defaultErrors() Errors {
 
 // config 是非泛型的配置结构，Option 操作它——
 // 这样 Option 无需携带类型参数（否则 WithIssuer 这类不接触 C 的选项无法推断 C）。
+// refreshClaims 字段例外：它必须感知 C，因此存 any 原值、调用处断言回具体函数类型
+// （见 refreshClaimsFor），类型不匹配会在首次签发时立即报错而非 panic。
 type config struct {
 	issuer        string
 	accessTTL     time.Duration
@@ -50,6 +57,7 @@ type config struct {
 	httpStatus    int
 	nowFunc       func() time.Time
 	errors        Errors
+	refreshClaims any // func(C) jwt.Claims：refresh token 的 claims 抽取函数，nil 表示不启用最小化
 }
 
 func defaultConfig() config {
@@ -88,8 +96,32 @@ func WithRefreshSecret(secret string) Option {
 	return func(c *config) { c.refreshSecret = secret }
 }
 
+// WithRefreshClaims 配置 refresh token 的 claims 抽取函数（claims 最小化，least privilege 主流实践）。
+// 未配置时 refresh token 与 access token 携带同一份业务 claims（默认行为）；
+// 配置后 refresh token 只携带 fn 的返回值——长效令牌泄漏时暴露面最小，
+// 用户资料变更后也不会把陈旧数据带进新一轮签发。
+//
+//	// refresh token 只装 userId，其余业务字段一律不进长效令牌
+//	gjwt.WithRefreshClaims(func(c *MyClaims) jwt.Claims {
+//	    return jwt.MapClaims{"userId": c.UserID}
+//	})
+//
+// 配套的续签模式（主流安全实践，见 ParseRefresh 文档）：
+//	ParseRefresh 验签 → 用 userId 查库确认用户状态并取最新数据 → 重建完整 claims → GenerateTokenPair。
+//
+// 注意两点：
+//   - fn 返回 claims 的 JSON 字段名需与 C 中同名字段对齐，ParseRefresh 才能把值还原进 C（其余字段为零值）；
+//   - fn 的参数类型必须与 Auth 的 C 一致，编译期无法拦截，类型不匹配会在首次签发时返回错误。
+func WithRefreshClaims[C jwt.Claims](fn func(C) jwt.Claims) Option {
+	return func(c *config) {
+		c.refreshClaims = fn
+	}
+}
+
 // WithErrors 覆盖库的默认错误（逐字段生效），
 // 例如适配前端自定义错误码：gjwt.WithErrors(gjwt.Errors{TokenExpired: gerror.NewCode(gcode.New(10041, "", nil), "登录已过期")})
+// 注意：传入的错误必须用 gerror.NewCode 构造（详见 Errors 类型说明），
+// 传 errors.New 等普通错误会导致响应中间件输出内部错误码 50。
 func WithErrors(e Errors) Option {
 	return func(c *config) {
 		if e.TokenMissing != nil {
@@ -167,6 +199,11 @@ func New[C jwt.Claims](accessSecret string, newClaims func() C, opts ...Option) 
 	if cfg.leeway < 0 {
 		return nil, gerror.Newf("leeway must not be negative, got %v", cfg.leeway)
 	}
+	// HTTP 状态码静态校验：越界值（如 0）会被 gf 缓冲式 Response 静默回退为 200，
+	// 与调用方意图相悖且难以排查，提前报错
+	if cfg.httpStatus < 100 || cfg.httpStatus > 599 {
+		return nil, gerror.Newf("http status must be in [100, 599], got %d", cfg.httpStatus)
+	}
 	a := &Auth[C]{
 		cfg:       cfg,
 		accessKey: []byte(accessSecret),
@@ -237,7 +274,8 @@ func (a *Auth[C]) GenerateToken(claims C) (string, error) {
 	return a.sign(claims, a.accessKey, a.cfg.accessTTL, a.now())
 }
 
-// GenerateTokenPair 签发双令牌，两个 token 携带同一份业务字段但用不同密钥签名。
+// GenerateTokenPair 签发双令牌：access token 携带完整业务 claims（短寿命），
+// refresh token 默认携带同一份 claims；配置 WithRefreshClaims 后只携带抽取出的最小 claims（长寿命）。
 func (a *Auth[C]) GenerateTokenPair(claims C) (*TokenPair, error) {
 	// 时间源只取一次：保证 token 内的 exp 与返回给前端的 ExpiresAt 严格一致，
 	// 避免两次取时跨秒导致前端按 ExpiresAt 做静默刷新时出现偏差
@@ -246,7 +284,11 @@ func (a *Auth[C]) GenerateTokenPair(claims C) (*TokenPair, error) {
 	if err != nil {
 		return nil, err
 	}
-	refresh, err := a.sign(claims, a.refreshKey, a.cfg.refreshTTL, now)
+	refreshClaims, err := a.refreshClaimsFor(claims)
+	if err != nil {
+		return nil, err
+	}
+	refresh, err := a.sign(refreshClaims, a.refreshKey, a.cfg.refreshTTL, now)
 	if err != nil {
 		return nil, err
 	}
@@ -258,13 +300,28 @@ func (a *Auth[C]) GenerateTokenPair(claims C) (*TokenPair, error) {
 	}, nil
 }
 
-// Parse 用 access 密钥验签并解析为 C（初始化时工厂函数定死的类型），单次原生解析。
-// 验签、过期校验、issuer 校验、算法白名单校验全部由 golang-jwt 完成，本库只做错误翻译。
-func (a *Auth[C]) Parse(tokenString string) (C, error) {
+// refreshClaimsFor 返回 refresh token 实际携带的 claims：
+// 未配置 WithRefreshClaims 时与 access claims 相同（默认行为）；
+// 配置后为抽取函数的返回值。config 非泛型所以存 any，在这里断言回具体类型，
+// 类型不匹配（fn 的 C 与 Auth 的 C 不一致）返回错误而非 panic，首次签发即暴露。
+func (a *Auth[C]) refreshClaimsFor(claims C) (jwt.Claims, error) {
+	if a.cfg.refreshClaims == nil {
+		return claims, nil
+	}
+	fn, ok := a.cfg.refreshClaims.(func(C) jwt.Claims)
+	if !ok {
+		return nil, gerror.New("WithRefreshClaims: fn must be of type func(C) jwt.Claims matching this Auth instance")
+	}
+	return fn(claims), nil
+}
+
+// parseWithKey 是 Parse/ParseRefresh 的共用实现：验签、过期校验、issuer 校验、
+// 算法白名单校验全部由 parser 完成，两个方法唯一的区别是用哪把密钥（密钥即身份）。
+func (a *Auth[C]) parseWithKey(tokenString string, key []byte) (C, error) {
 	var zero C
 	claims := a.newClaims()
 	_, err := a.parser.ParseWithClaims(tokenString, claims, func(*jwt.Token) (interface{}, error) {
-		return a.accessKey, nil
+		return key, nil
 	})
 	if err != nil {
 		return zero, a.mapError(err)
@@ -272,23 +329,48 @@ func (a *Auth[C]) Parse(tokenString string) (C, error) {
 	return claims, nil
 }
 
-// RefreshTokenPair 用 refresh 密钥验签续签 token 并签发新令牌对。
-// 拿 access token 调本接口会在 refresh 密钥处验签失败，无需类型字段判断。
+// Parse 用 access 密钥验签并解析为 C（初始化时工厂函数定死的类型），单次原生解析。
+// 验签、过期校验、issuer 校验、算法白名单校验全部由 golang-jwt 完成，本库只做错误翻译。
+func (a *Auth[C]) Parse(tokenString string) (C, error) {
+	return a.parseWithKey(tokenString, a.accessKey)
+}
+
+// ParseRefresh 用 refresh 密钥验签续签 token 并解析为 C，与 Parse 对称。
+// 拿 access token 调本方法会在 refresh 密钥处验签失败，无需类型字段判断。
+//
+// 它存在的意义是把"验签"与"重新签发"解耦（RefreshTokenPair 把两者绑死），
+// 解锁主流的安全续签模式——续签时服务端必须有机会介入校验：
+//
+//	claims, err := auth.ParseRefresh(refreshToken)   // 1. 验签续签 token
+//	if err != nil { /* 让用户重新登录 */ }
+//	user := db.GetUser(claims.UserID)                // 2. 查库：确认未被禁用 + 取最新数据
+//	if user.Disabled { /* 拒绝续签 */ }
+//	pair, err := auth.GenerateTokenPair(&MyClaims{   // 3. 用最新数据重建 claims 重新签发
+//	    UserID: user.ID, Role: user.Role,
+//	})
+//
+// 若配置了 WithRefreshClaims，claims 中通常只有标识字段（如 UserID）有值，
+// 其余字段为零值——这正好强制业务走"查库重建"而不是信任 token 里的陈旧数据。
+// 封禁的用户因此在 refresh token 过期前无法继续续签。
+func (a *Auth[C]) ParseRefresh(tokenString string) (C, error) {
+	return a.parseWithKey(tokenString, a.refreshKey)
+}
+
+// RefreshTokenPair 用 refresh 密钥验签续签 token 并原样签发新令牌对（claims 不经服务端介入）。
+// 适用于无状态、无吊销需求的内部服务；对外业务建议使用 ParseRefresh + 查库重建的
+// 三步式续签（见 ParseRefresh 文档），在续签前确认用户状态。
 func (a *Auth[C]) RefreshTokenPair(refreshToken string) (*TokenPair, error) {
-	claims := a.newClaims()
-	_, err := a.parser.ParseWithClaims(refreshToken, claims, func(*jwt.Token) (interface{}, error) {
-		return a.refreshKey, nil
-	})
+	claims, err := a.ParseRefresh(refreshToken)
 	if err != nil {
-		return nil, a.mapError(err)
+		return nil, err
 	}
 	return a.GenerateTokenPair(claims)
 }
 
-// sign 把 C 序列化为 map 后签名。
+// sign 把 claims 序列化为 map 后签名（C 与 jwt.Claims 均可传入）。
 // 走 map 中转的原因：exp/iat/jti/iss 这些注册字段由库统一写入并覆盖，
 // 用户构造 claims 时完全不用手动填 NumericDate（教程里最啰嗦的部分）。
-func (a *Auth[C]) sign(claims C, key []byte, ttl time.Duration, now time.Time) (string, error) {
+func (a *Auth[C]) sign(claims jwt.Claims, key []byte, ttl time.Duration, now time.Time) (string, error) {
 	data, err := json.Marshal(claims)
 	if err != nil {
 		return "", gerror.Wrap(err, "marshal claims failed")
@@ -318,11 +400,12 @@ func (a *Auth[C]) sign(claims C, key []byte, ttl time.Duration, now time.Time) (
 // mappedError 是验签失败的统一错误载体：
 // Error() 与错误码始终为用户配置的值（响应中间件只会输出干净的提示语，不泄漏 jwt 内部细节），
 // 错误链同时保留配置错误实例（errors.Is(err, gjwt.ErrTokenExpired) 照常可用）
-// 与验签失败的原始原因（errors.As / %+v 可查真实原因，如签名不符 / issuer 不符，供排障）。
+// 与失败的原始原因（errors.As / %+v 可查真实原因，如签名不符 / issuer 不符，供排障）。
 type mappedError struct {
 	configured error  // 用户配置或库默认的错误实例（含 gcode 错误码）
-	cause      error  // golang-jwt 返回的原始错误
+	cause      error  // 原始错误：golang-jwt 验签错误，或 token 提取阶段的错误
 	msg        string // 对外提示语，与 configured.Error() 一致
+	missing    bool   // 语义类别：请求未携带 token 为 true（供 reject 决定 WWW-Authenticate 格式）
 }
 
 func (e *mappedError) Error() string    { return e.msg }

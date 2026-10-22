@@ -48,6 +48,9 @@ func TestNew_InvalidConfig(t *testing.T) {
 		{"refreshTTL 为负", testSecret, []Option{WithRefreshTTL(-time.Hour)}},
 		{"refreshTTL 短于 accessTTL", testSecret, []Option{WithAccessTTL(2 * time.Hour), WithRefreshTTL(time.Hour)}},
 		{"leeway 为负", testSecret, []Option{WithLeeway(-time.Second)}},
+		{"httpStatus 为 0", testSecret, []Option{WithHTTPStatus(0)}},
+		{"httpStatus 为负", testSecret, []Option{WithHTTPStatus(-1)}},
+		{"httpStatus 超过 599", testSecret, []Option{WithHTTPStatus(600)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -260,5 +263,136 @@ func TestMapErrorKeepsOriginalCause(t *testing.T) {
 	}
 	if !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
 		t.Fatalf("错误链应保留原始验签错误，got %v", err)
+	}
+}
+
+// TestParseRefresh 验证续签验签路径：与 Parse 对称但用 refresh 密钥，
+// 且过期时同样报 expired（而非 invalid）。
+func TestParseRefresh(t *testing.T) {
+	base := time.Unix(1700000000, 0)
+	now := base
+	a := newTestAuth(t,
+		WithAccessTTL(time.Hour),
+		WithRefreshTTL(24*time.Hour),
+		WithLeeway(time.Minute),
+		WithTimeFunc(func() time.Time { return now }),
+	)
+	pair, err := a.GenerateTokenPair(&testClaims{UserID: 42, Name: "u42"})
+	if err != nil {
+		t.Fatalf("GenerateTokenPair() error = %v", err)
+	}
+	// 正常路径：refresh token 可通过 ParseRefresh，业务字段完整
+	claims, err := a.ParseRefresh(pair.RefreshToken)
+	if err != nil {
+		t.Fatalf("refresh token 应通过 ParseRefresh: %v", err)
+	}
+	if claims.UserID != 42 || claims.Name != "u42" {
+		t.Fatalf("业务字段应完整: got UserID=%d Name=%q", claims.UserID, claims.Name)
+	}
+	// 密钥隔离：access token 不能通过 refresh 密钥验签
+	if _, err := a.ParseRefresh(pair.AccessToken); err == nil {
+		t.Fatal("access token 不应通过 ParseRefresh 验签")
+	}
+	// refresh token 过期（超过 leeway）应报 expired
+	now = base.Add(25 * time.Hour)
+	_, err = a.ParseRefresh(pair.RefreshToken)
+	if !errors.Is(err, ErrTokenExpired) {
+		t.Fatalf("过期的 refresh token 应报 expired，got %v", err)
+	}
+}
+
+// TestRefreshClaimsMinimization 验证 WithRefreshClaims 的最小化行为：
+// refresh token 只携带抽取函数返回的字段，access token 仍携带全量业务字段。
+func TestRefreshClaimsMinimization(t *testing.T) {
+	a := newTestAuth(t,
+		WithRefreshClaims(func(c *testClaims) jwt.Claims {
+			// 主流实践：refresh 只保留续签所需的标识字段
+			return jwt.MapClaims{"userId": c.UserID}
+		}),
+	)
+	pair, err := a.GenerateTokenPair(&testClaims{UserID: 7, Name: "alice"})
+	if err != nil {
+		t.Fatalf("GenerateTokenPair() error = %v", err)
+	}
+	// access token 仍是全量 claims
+	accessClaims, err := a.Parse(pair.AccessToken)
+	if err != nil {
+		t.Fatalf("access token 应通过 Parse: %v", err)
+	}
+	if accessClaims.UserID != 7 || accessClaims.Name != "alice" {
+		t.Fatalf("access token 应携带全量业务字段: got %+v", accessClaims)
+	}
+	// refresh token 解析回 C：标识字段对齐（userId tag 一致）可还原，其余字段为零值
+	refreshClaims, err := a.ParseRefresh(pair.RefreshToken)
+	if err != nil {
+		t.Fatalf("refresh token 应通过 ParseRefresh: %v", err)
+	}
+	if refreshClaims.UserID != 7 {
+		t.Fatalf("标识字段应还原: want 7, got %d", refreshClaims.UserID)
+	}
+	if refreshClaims.Name != "" {
+		t.Fatalf("未进入抽取函数的字段应为零值: got Name=%q", refreshClaims.Name)
+	}
+}
+
+// TestRefreshClaimsFuncTypeMismatch 验证 WithRefreshClaims 的函数类型
+// 与 Auth 实例的 C 不一致时，签发返回错误而非 panic。
+func TestRefreshClaimsFuncTypeMismatch(t *testing.T) {
+	// 故意用另一种 claims 类型的函数配置给 *testClaims 的 Auth
+	a, err := New(testSecret, newTestClaims,
+		WithRefreshClaims(func(c *otherClaims) jwt.Claims {
+			return jwt.MapClaims{}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New() 不应在初始化阶段报错（类型检查延迟到签发）: %v", err)
+	}
+	if _, err := a.GenerateTokenPair(&testClaims{UserID: 1}); err == nil {
+		t.Fatal("类型不匹配的抽取函数在签发时应返回错误")
+	}
+}
+
+// otherClaims 用于构造类型不匹配场景（不与 testClaims 兼容）。
+type otherClaims struct {
+	jwt.RegisteredClaims
+}
+
+// TestRefreshRotationPattern 模拟主流三步式续签：
+// ParseRefresh 验签 → 查库确认状态并取最新数据 → 重建 claims 重新签发。
+// 关键断言：新 access token 的业务字段来自"查库结果"而非旧 token 中的陈旧数据。
+func TestRefreshRotationPattern(t *testing.T) {
+	a := newTestAuth(t,
+		WithRefreshClaims(func(c *testClaims) jwt.Claims {
+			return jwt.MapClaims{"userId": c.UserID}
+		}),
+	)
+	// 登录：签发时用户角色是 admin
+	pair, err := a.GenerateTokenPair(&testClaims{UserID: 9, Name: "bob"})
+	if err != nil {
+		t.Fatalf("GenerateTokenPair() error = %v", err)
+	}
+	// 模拟 token 有效期内数据变更：查库发现名字已改
+	dbName := "bob-new"
+	// 续签三步式：
+	rc, err := a.ParseRefresh(pair.RefreshToken) // 1. 验签（只有 userId 有值）
+	if err != nil {
+		t.Fatalf("ParseRefresh() error = %v", err)
+	}
+	// 2. 查库（此处以 dbName 模拟）并确认用户状态，略
+	// 3. 用最新数据重建 claims 签发新对
+	pair2, err := a.GenerateTokenPair(&testClaims{UserID: rc.UserID, Name: dbName})
+	if err != nil {
+		t.Fatalf("GenerateTokenPair() error = %v", err)
+	}
+	// 新 access token 携带的是查库后的最新数据
+	claims, err := a.Parse(pair2.AccessToken)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if claims.Name != dbName {
+		t.Fatalf("新 access token 应携带查库后的最新数据: want %q, got %q", dbName, claims.Name)
+	}
+	if claims.UserID != 9 {
+		t.Fatalf("标识字段应从 refresh token 传递: want 9, got %d", claims.UserID)
 	}
 }
