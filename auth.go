@@ -110,11 +110,16 @@ func WithRefreshSecret(secret string) Option {
 //
 //	ParseRefresh 验签 → 用 userId 查库确认用户状态并取最新数据 → 重建完整 claims → GenerateTokenPair。
 //
-// 注意两点：
+// 注意三点：
 //   - fn 返回 claims 的 JSON 字段名需与 C 中同名字段对齐，ParseRefresh 才能把值还原进 C（其余字段为零值）；
-//   - fn 的参数类型必须与 Auth 的 C 一致，编译期无法拦截，类型不匹配会在 New 时返回错误。
+//   - fn 的参数类型必须与 Auth 的 C 一致，编译期无法拦截，类型不匹配会在 New 时返回错误；
+//   - fn 传 nil 视为不启用（与未配置一致）：typed-nil 装箱进 any 后 != nil，
+//     若不拦截会绕过判空并在首次签发时触发 nil 函数调用 panic。
 func WithRefreshClaims[C jwt.Claims](fn func(C) jwt.Claims) Option {
 	return func(c *config) {
+		if fn == nil {
+			return
+		}
 		c.refreshClaims = fn
 	}
 }

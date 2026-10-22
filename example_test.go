@@ -4,6 +4,7 @@ package gjwt_test
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 
@@ -26,7 +27,7 @@ func ExampleNew() {
 		"0123456789abcdef0123456789abcdef",      // 至少 32 字节的 HS256 密钥
 		func() *MyClaims { return &MyClaims{} }, // claims 工厂：定死解析返回的类型
 		gjwt.WithIssuer("my-app"),
-		gjwt.WithAccessTTL(2*60*60*1e9), // 2 小时（time.Duration）
+		gjwt.WithAccessTTL(2*time.Hour), // access token 有效期 2 小时
 	)
 	if err != nil {
 		panic(err)

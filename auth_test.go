@@ -354,6 +354,25 @@ type otherClaims struct {
 	jwt.RegisteredClaims
 }
 
+// TestRefreshClaimsNilFunc 验证 WithRefreshClaims 传 nil 时不启用最小化：
+// typed-nil 装箱进 any 后 != nil，若不拦截会绕过 New 的判空与类型断言
+// （类型匹配、值为 nil 的函数），并在首次签发时触发 nil 函数调用 panic；
+// 修复后 nil 与"未配置"同义，回落为默认行为（refresh 携带全量 claims）。
+func TestRefreshClaimsNilFunc(t *testing.T) {
+	a := newTestAuth(t, WithRefreshClaims[*testClaims](nil))
+	pair, err := a.GenerateTokenPair(&testClaims{UserID: 3, Name: "carol"})
+	if err != nil {
+		t.Fatalf("GenerateTokenPair() error = %v", err)
+	}
+	claims, err := a.ParseRefresh(pair.RefreshToken)
+	if err != nil {
+		t.Fatalf("ParseRefresh() error = %v", err)
+	}
+	if claims.UserID != 3 || claims.Name != "carol" {
+		t.Fatalf("nil fn 应回落为默认行为（refresh 携带全量 claims）: %+v", claims)
+	}
+}
+
 // TestRefreshRotationPattern 模拟主流三步式续签：
 // ParseRefresh 验签 → 查库确认状态并取最新数据 → 重建 claims 重新签发。
 // 关键断言：新 access token 的业务字段来自"查库结果"而非旧 token 中的陈旧数据。
