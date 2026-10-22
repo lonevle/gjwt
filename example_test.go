@@ -23,7 +23,7 @@ type MyClaims struct {
 // 初始化可复杂（一次性配置全部行为），调用保持简单（业务侧三五行完成签发/解析）。
 func ExampleNew() {
 	auth, err := gjwt.New(
-		"0123456789abcdef0123456789abcdef", // 至少 32 字节的 HS256 密钥
+		"0123456789abcdef0123456789abcdef",      // 至少 32 字节的 HS256 密钥
 		func() *MyClaims { return &MyClaims{} }, // claims 工厂：定死解析返回的类型
 		gjwt.WithIssuer("my-app"),
 		gjwt.WithAccessTTL(2*60*60*1e9), // 2 小时（time.Duration）

@@ -47,7 +47,7 @@ func defaultErrors() Errors {
 // config 是非泛型的配置结构，Option 操作它——
 // 这样 Option 无需携带类型参数（否则 WithIssuer 这类不接触 C 的选项无法推断 C）。
 // refreshClaims 字段例外：它必须感知 C，因此存 any 原值、调用处断言回具体函数类型
-// （见 refreshClaimsFor），类型不匹配会在首次签发时立即报错而非 panic。
+// （见 New 与 refreshClaimsFor），类型不匹配在 New 时即报错。
 type config struct {
 	issuer        string
 	accessTTL     time.Duration
@@ -107,11 +107,12 @@ func WithRefreshSecret(secret string) Option {
 //	})
 //
 // 配套的续签模式（主流安全实践，见 ParseRefresh 文档）：
+//
 //	ParseRefresh 验签 → 用 userId 查库确认用户状态并取最新数据 → 重建完整 claims → GenerateTokenPair。
 //
 // 注意两点：
 //   - fn 返回 claims 的 JSON 字段名需与 C 中同名字段对齐，ParseRefresh 才能把值还原进 C（其余字段为零值）；
-//   - fn 的参数类型必须与 Auth 的 C 一致，编译期无法拦截，类型不匹配会在首次签发时返回错误。
+//   - fn 的参数类型必须与 Auth 的 C 一致，编译期无法拦截，类型不匹配会在 New 时返回错误。
 func WithRefreshClaims[C jwt.Claims](fn func(C) jwt.Claims) Option {
 	return func(c *config) {
 		c.refreshClaims = fn
@@ -203,6 +204,13 @@ func New[C jwt.Claims](accessSecret string, newClaims func() C, opts ...Option) 
 	// 与调用方意图相悖且难以排查，提前报错
 	if cfg.httpStatus < 100 || cfg.httpStatus > 599 {
 		return nil, gerror.Newf("http status must be in [100, 599], got %d", cfg.httpStatus)
+	}
+	// WithRefreshClaims 的抽取函数类型在初始化即校验：config 非泛型存的是 any，
+	// 这里有 C 的完整上下文，可把原本延迟到首次签发的类型错误提前到启动阶段
+	if cfg.refreshClaims != nil {
+		if _, ok := cfg.refreshClaims.(func(C) jwt.Claims); !ok {
+			return nil, gerror.New("WithRefreshClaims: fn must be of type func(C) jwt.Claims matching this Auth instance")
+		}
 	}
 	a := &Auth[C]{
 		cfg:       cfg,
@@ -302,8 +310,8 @@ func (a *Auth[C]) GenerateTokenPair(claims C) (*TokenPair, error) {
 
 // refreshClaimsFor 返回 refresh token 实际携带的 claims：
 // 未配置 WithRefreshClaims 时与 access claims 相同（默认行为）；
-// 配置后为抽取函数的返回值。config 非泛型所以存 any，在这里断言回具体类型，
-// 类型不匹配（fn 的 C 与 Auth 的 C 不一致）返回错误而非 panic，首次签发即暴露。
+// 配置后为抽取函数的返回值。config 非泛型所以存 any，在这里断言回具体类型——
+// New 已做过同样的校验，此处是运行时兜底，正常路径不会走到失败分支。
 func (a *Auth[C]) refreshClaimsFor(claims C) (jwt.Claims, error) {
 	if a.cfg.refreshClaims == nil {
 		return claims, nil
@@ -359,6 +367,11 @@ func (a *Auth[C]) ParseRefresh(tokenString string) (C, error) {
 // RefreshTokenPair 用 refresh 密钥验签续签 token 并原样签发新令牌对（claims 不经服务端介入）。
 // 适用于无状态、无吊销需求的内部服务；对外业务建议使用 ParseRefresh + 查库重建的
 // 三步式续签（见 ParseRefresh 文档），在续签前确认用户状态。
+//
+// 注意与 WithRefreshClaims 的组合：最小化配置下 refresh token 只携带标识字段，
+// 本方法续出的新 access token 同样只含这些字段（Name/Role 等业务字段为零值）。
+// handler 依赖这些字段时必须改用三步式续签；handler 本来就只取标识字段（业务数据
+// 每次查库）时，本方法仍可安全使用。
 func (a *Auth[C]) RefreshTokenPair(refreshToken string) (*TokenPair, error) {
 	claims, err := a.ParseRefresh(refreshToken)
 	if err != nil {

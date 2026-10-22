@@ -120,6 +120,8 @@ auth, err := gjwt.New(secret, func() *MyClaims { return &MyClaims{} },
 
 注意：返回 claims 的 JSON 字段名需与 C 中同名字段对齐（如 `userId`），`ParseRefresh` 才能把值还原进 C。
 
+注意与 `RefreshTokenPair` 的组合：最小化配置下，`RefreshTokenPair`（原样回签）续出的新 access token 同样只携带最小字段（Name/Role 等为零值）——handler 依赖这些字段时必须用三步式续签；handler 本来就只取标识字段（业务数据每次查库）时，`RefreshTokenPair` 仍可安全使用。
+
 ## 配置项
 
 | Option | 默认值 | 说明 |

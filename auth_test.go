@@ -336,19 +336,16 @@ func TestRefreshClaimsMinimization(t *testing.T) {
 }
 
 // TestRefreshClaimsFuncTypeMismatch 验证 WithRefreshClaims 的函数类型
-// 与 Auth 实例的 C 不一致时，签发返回错误而非 panic。
+// 与 Auth 实例的 C 不一致时，初始化即报错（启动阶段暴露，而非首次签发）。
 func TestRefreshClaimsFuncTypeMismatch(t *testing.T) {
 	// 故意用另一种 claims 类型的函数配置给 *testClaims 的 Auth
-	a, err := New(testSecret, newTestClaims,
+	_, err := New(testSecret, newTestClaims,
 		WithRefreshClaims(func(c *otherClaims) jwt.Claims {
 			return jwt.MapClaims{}
 		}),
 	)
-	if err != nil {
-		t.Fatalf("New() 不应在初始化阶段报错（类型检查延迟到签发）: %v", err)
-	}
-	if _, err := a.GenerateTokenPair(&testClaims{UserID: 1}); err == nil {
-		t.Fatal("类型不匹配的抽取函数在签发时应返回错误")
+	if err == nil {
+		t.Fatal("类型不匹配的抽取函数应在 New 时返回错误")
 	}
 }
 
