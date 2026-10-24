@@ -34,33 +34,29 @@ func newTestAuth(t *testing.T, opts ...Option) *Auth[*testClaims] {
 
 func TestNew_InvalidConfig(t *testing.T) {
 	tests := []struct {
-		name   string
-		secret string
-		opts   []Option
+		name    string
+		secret  string
+		factory func() *testClaims
+		opts    []Option
 	}{
-		{"空密钥", "", nil},
-		{"空白密钥", "   ", nil},
-		{"密钥过短", "short-secret", nil},
-		{"claims 工厂为 nil", testSecret, nil},
-		{"续签密钥与业务密钥相同", testSecret, []Option{WithRefreshSecret(testSecret)}},
-		{"续签密钥过短", testSecret, []Option{WithRefreshSecret("short")}},
-		{"accessTTL 为负", testSecret, []Option{WithAccessTTL(-time.Hour)}},
-		{"refreshTTL 为负", testSecret, []Option{WithRefreshTTL(-time.Hour)}},
-		{"refreshTTL 短于 accessTTL", testSecret, []Option{WithAccessTTL(2 * time.Hour), WithRefreshTTL(time.Hour)}},
-		{"leeway 为负", testSecret, []Option{WithLeeway(-time.Second)}},
-		{"httpStatus 为 0", testSecret, []Option{WithHTTPStatus(0)}},
-		{"httpStatus 为负", testSecret, []Option{WithHTTPStatus(-1)}},
-		{"httpStatus 超过 599", testSecret, []Option{WithHTTPStatus(600)}},
+		{"空密钥", "", newTestClaims, nil},
+		{"空白密钥", "   ", newTestClaims, nil},
+		{"密钥过短", "short-secret", newTestClaims, nil},
+		{"claims 工厂为 nil", testSecret, nil, nil},
+		{"claims 工厂返回 nil 实例", testSecret, func() *testClaims { return nil }, nil},
+		{"续签密钥与业务密钥相同", testSecret, newTestClaims, []Option{WithRefreshSecret(testSecret)}},
+		{"续签密钥过短", testSecret, newTestClaims, []Option{WithRefreshSecret("short")}},
+		{"accessTTL 为负", testSecret, newTestClaims, []Option{WithAccessTTL(-time.Hour)}},
+		{"refreshTTL 为负", testSecret, newTestClaims, []Option{WithRefreshTTL(-time.Hour)}},
+		{"refreshTTL 短于 accessTTL", testSecret, newTestClaims, []Option{WithAccessTTL(2 * time.Hour), WithRefreshTTL(time.Hour)}},
+		{"leeway 为负", testSecret, newTestClaims, []Option{WithLeeway(-time.Second)}},
+		{"httpStatus 为 0", testSecret, newTestClaims, []Option{WithHTTPStatus(0)}},
+		{"httpStatus 为负", testSecret, newTestClaims, []Option{WithHTTPStatus(-1)}},
+		{"httpStatus 超过 599", testSecret, newTestClaims, []Option{WithHTTPStatus(600)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.name == "claims 工厂为 nil" {
-				if _, err := New[*testClaims](tt.secret, nil, tt.opts...); err == nil {
-					t.Fatal("New() 应返回错误，实际为 nil")
-				}
-				return
-			}
-			if _, err := New(tt.secret, newTestClaims, tt.opts...); err == nil {
+			if _, err := New(tt.secret, tt.factory, tt.opts...); err == nil {
 				t.Fatal("New() 应返回错误，实际为 nil")
 			}
 		})
@@ -125,6 +121,21 @@ func TestIssuerValidation(t *testing.T) {
 	}
 }
 
+// TestMissingExpRejected 验证缺失 exp 的 token 被拒绝：
+// golang-jwt 默认不要求 exp 存在，无 exp 的 token 签名正确即永久有效；
+// 本库签发的 token 恒有 exp，这道防线针对共享同一密钥的其他签发方产出的无过期 token。
+func TestMissingExpRejected(t *testing.T) {
+	a := newTestAuth(t)
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"userId": int64(1)}).
+		SignedString([]byte(testSecret))
+	if err != nil {
+		t.Fatalf("构造无 exp token 失败: %v", err)
+	}
+	if _, err := a.Parse(token); !errors.Is(err, ErrTokenInvalid) {
+		t.Fatalf("缺失 exp 的 token 应报 invalid, got %v", err)
+	}
+}
+
 func TestKeyIsolation(t *testing.T) {
 	a := newTestAuth(t)
 	pair, err := a.GenerateTokenPair(&testClaims{UserID: 1})
@@ -153,6 +164,37 @@ func TestKeyIsolation(t *testing.T) {
 	}
 	if claims2.UserID != 1 {
 		t.Fatalf("续签后业务字段丢失：want 1, got %d", claims2.UserID)
+	}
+}
+
+// TestKeyIsolationExplicitSecret 显式 WithRefreshSecret 路径的密钥隔离与可用性：
+// 与默认的 HMAC 派生密钥路径分开验证，且显式密钥必须真实生效——
+// 不同 refresh 密钥的实例间续签 token 不可互通。
+func TestKeyIsolationExplicitSecret(t *testing.T) {
+	const refreshSecret = "fedcba9876543210fedcba9876543210"
+	a := newTestAuth(t, WithRefreshSecret(refreshSecret))
+	pair, err := a.GenerateTokenPair(&testClaims{UserID: 1})
+	if err != nil {
+		t.Fatalf("GenerateTokenPair() error = %v", err)
+	}
+	if _, err := a.Parse(pair.RefreshToken); err == nil {
+		t.Fatal("refresh token 不应通过 Parse 验签")
+	}
+	claims, err := a.ParseRefresh(pair.RefreshToken)
+	if err != nil {
+		t.Fatalf("refresh token 应通过 ParseRefresh: %v", err)
+	}
+	if claims.UserID != 1 {
+		t.Fatalf("业务字段应保留: got %d", claims.UserID)
+	}
+	// 派生密钥实例签出的 refresh token 不应通过显式密钥实例的验签
+	a2 := newTestAuth(t)
+	pair2, err := a2.GenerateTokenPair(&testClaims{UserID: 2})
+	if err != nil {
+		t.Fatalf("GenerateTokenPair() error = %v", err)
+	}
+	if _, err := a.ParseRefresh(pair2.RefreshToken); err == nil {
+		t.Fatal("不同 refresh 密钥的实例间 token 不应互通")
 	}
 }
 
@@ -215,6 +257,35 @@ func TestCustomErrors(t *testing.T) {
 	}
 	if err.Error() != "登录已过期" {
 		t.Fatalf("提示语应为自定义内容，got %q", err.Error())
+	}
+}
+
+// TestWithErrorsPlainErrorAutoCode 验证以普通错误（errors.New，无 gcode）覆盖错误时的自动补码：
+// 补上 401 码的同时，提示语与错误链（匹配用户传入的原错误实例）保持不变，
+// gf 响应中间件不再把它改写为内部错误码 50。
+func TestWithErrorsPlainErrorAutoCode(t *testing.T) {
+	plain := errors.New("登录已过期")
+	base := time.Unix(1700000000, 0)
+	now := base
+	a := newTestAuth(t,
+		WithAccessTTL(time.Hour),
+		WithErrors(Errors{TokenExpired: plain}),
+		WithTimeFunc(func() time.Time { return now }),
+	)
+	token, err := a.GenerateToken(&testClaims{UserID: 1})
+	if err != nil {
+		t.Fatalf("GenerateToken() error = %v", err)
+	}
+	now = base.Add(2 * time.Hour)
+	_, err = a.Parse(token)
+	if !errors.Is(err, plain) {
+		t.Fatalf("错误链应保留用户传入的原错误实例, got %v", err)
+	}
+	if got := gerror.Code(err).Code(); got != 401 {
+		t.Fatalf("普通错误应自动补上 401 码, got %d", got)
+	}
+	if err.Error() != "登录已过期" {
+		t.Fatalf("提示语应保持不变, got %q", err.Error())
 	}
 }
 

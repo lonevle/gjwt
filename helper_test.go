@@ -44,6 +44,30 @@ func TestExtractToken(t *testing.T) {
 	}
 }
 
+// FuzzExtractToken 断言 ExtractToken 的核心不变量：返回错误时必不携带 token，
+// 成功时 token 必非空。种子用例在普通 go test 中即执行，-fuzz 时随机探索。
+func FuzzExtractToken(f *testing.F) {
+	for _, seed := range []string{
+		"Bearer abc", "bearer abc", "BEARER abc", "Bearer   abc", "abc", "",
+		"Bearer", "Bearer   ", "Basic abc", "Bearer\tabc", "Bearer abc def",
+	} {
+		f.Add(seed, "")
+		f.Add("", seed)
+	}
+	f.Fuzz(func(t *testing.T, headerValue, queryValue string) {
+		token, err := ExtractToken(headerValue, queryValue)
+		if err != nil {
+			if token != "" {
+				t.Fatalf("err != nil 时 token 应为空: token=%q, err=%v", token, err)
+			}
+			return
+		}
+		if token == "" {
+			t.Fatal("err == nil 时 token 必非空")
+		}
+	})
+}
+
 // TestGetRequestToken 验证从 GoFrame 请求对象提取 token 的取值路径。
 func TestGetRequestToken(t *testing.T) {
 	// 从 query 提取

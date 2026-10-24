@@ -78,6 +78,8 @@ func (c *UserCtrl) Profile(r *ghttp.Request) {
 }
 ```
 
+> **CORS 预检**：OPTIONS 预检请求不携带 Authorization 头。鉴权中间件不要挂在包含跨域路由的分组上——预检会被 401 拒绝，浏览器端表现为跨域失败且难以排查。预检应由挂在更外层、先于鉴权执行的 CORS 中间件处理。
+
 token 提取兼容 `Authorization: Bearer xxx`（大小写不敏感）、裸 token、`?token=xxx`（仅建议用于下载/WebSocket 等无法带 header 的场景）。
 
 ## 续签：三步式（推荐）
@@ -148,18 +150,19 @@ auth, _ := gjwt.New(secret, newClaims,
 ```
 
 - 三场景：`TokenMissing`（未携带）、`TokenInvalid`（验签失败/格式非法/issuer 不符）、`TokenExpired`（已过期）
-- **传入的错误必须用 `gerror.NewCode` 构造**：普通 `errors.New` 会被 gf 响应中间件改写为内部错误码 50，出现"HTTP 401 + body code 50"的矛盾响应
+- **传入普通错误（如 `errors.New`）同样安全**：`New` 会自动补上 401 码，提示语与错误链（`errors.Is` 匹配原实例）保持不变；需要自定义错误码时才用 `gerror.NewCode`
 - 错误链保留原始验签原因：`errors.As` / `%+v` 可查真实失败原因（签名不符、issuer 不符等），对外提示语不泄漏 JWT 内部细节
 - 鉴权失败（401）时自动携带 `WWW-Authenticate: Bearer` 或 `Bearer error="invalid_token"`（RFC 6750）
 
 ## 安全注意事项
 
-1. **密钥长度**：HS256 密钥至少 32 字节（RFC 7518 要求），`New` 会拒绝过短密钥；生产环境勿硬编码
+1. **密钥长度**：HS256 密钥至少 32 字节（RFC 7518 要求），`New` 会拒绝过短密钥；生产环境勿硬编码，建议用 `crypto/rand` 生成（如 32 字节随机数再 base64 编码）。注意长度校验不识别强度——全同字符、可预测的字符串虽能通过校验但安全性不足
 2. **算法锁定**：验签 Parser 锁定 HS256 白名单，杜绝 `alg: none` / 算法混淆攻击
-3. **吊销**：本库无状态、不内置黑名单。每个 token 均有唯一 `jti`（`claims.ID`），需要吊销能力时由业务层用它自建黑名单/白名单
-4. **续签轮换（rotation）**：无状态 JWT 无法单点作废旧 refresh token；高安全场景建议业务层记录每用户最近一次续签的 jti，检测到旧 token 复用即强制下线
-5. **query 传 token**：会进入访问日志与浏览器历史，仅用于无法携带 header 的场景
-6. **假时钟仅用于测试**：`WithTimeFunc` 生产环境不要配置
+3. **exp 必填**：验签强制要求 `exp` 存在，共享同一密钥的其他签发方产出的无过期 token 会被直接拒绝
+4. **吊销**：本库无状态、不内置黑名单。每个 token 均有唯一 `jti`（`claims.ID`），需要吊销能力时由业务层用它自建黑名单/白名单
+5. **续签轮换（rotation）**：无状态 JWT 无法单点作废旧 refresh token；高安全场景建议业务层记录每用户最近一次续签的 jti，检测到旧 token 复用即强制下线
+6. **query 传 token**：会进入访问日志与浏览器历史，仅用于无法携带 header 的场景
+7. **假时钟仅用于测试**：`WithTimeFunc` 生产环境不要配置
 
 ## 测试
 

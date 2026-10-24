@@ -109,6 +109,26 @@ func TestMiddleware_HappyPath(t *testing.T) {
 	}
 }
 
+// TestMiddleware_QueryToken 验证 ?token= 提取路径的完整中间件链路
+// （无法携带 header 的场景：文件下载、WebSocket 等）。
+func TestMiddleware_QueryToken(t *testing.T) {
+	a := newTestAuth(t)
+	url := startAuthServer(t, a)
+	pair, err := a.GenerateTokenPair(&testClaims{UserID: 7, Name: "bob"})
+	if err != nil {
+		t.Fatalf("GenerateTokenPair() error = %v", err)
+	}
+	// JWT 的 base64url 字符集（A-Za-z0-9-_.）均为 URL 安全字符，可直接拼接
+	status, _, body := httpGet(t, url+"?token="+pair.AccessToken, "")
+	if status != http.StatusOK {
+		t.Fatalf("query 携带有效 token 应返回 200，got %d, body %s", status, body)
+	}
+	m := decodeBody(t, body)
+	if m["userId"] != float64(7) || m["name"] != "bob" {
+		t.Fatalf("handler 应从 ctx 取到完整 claims: %v", m)
+	}
+}
+
 // TestMiddleware_MissingToken 验证未携带 token 的拒绝路径：
 // 401 + WWW-Authenticate: Bearer（无 error 参数，RFC 6750 语义）+ 响应中间件输出配置的错误。
 func TestMiddleware_MissingToken(t *testing.T) {

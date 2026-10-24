@@ -1,6 +1,6 @@
 module github.com/lonevle/gjwt
 
-go 1.26.10
+go 1.23.0
 
 require (
 	github.com/gogf/gf/v2 v2.10.3

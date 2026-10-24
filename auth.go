@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"time"
 
@@ -26,10 +27,11 @@ const minSecretLen = 32
 // 用 gerror.NewCode(gcode.New(自定义码, "", nil), "提示语") 传入即可适配任意前端的错误码约定。
 // 只覆盖需要的字段，未设置的保持库默认值（统一为 401）。
 //
-// 重要：字段虽然声明为 error，但必须传入 gerror.NewCode 构造的错误实例。
-// 若传入普通错误（如 errors.New），mappedError.Code() 会得到 CodeNil，
-// gf 的 MiddlewareHandlerResponse 随即把它替换为 CodeInternalError（码 50），
-// 出现"HTTP 401 + body code 50"的自相矛盾响应。
+// 普通错误（如 errors.New）也可直接传入：New 时会自动补上 401 码，
+// 提示语与错误链（errors.Is 匹配原实例）保持不变——若不补码，普通错误的
+// Code() 为 CodeNil，gf 的 MiddlewareHandlerResponse 会把它替换为
+// CodeInternalError（码 50），出现"HTTP 401 + body code 50"的自相矛盾响应。
+// 需要自定义错误码时用 gerror.NewCode 构造。
 type Errors struct {
 	TokenMissing error // 请求中未携带 token
 	TokenInvalid error // 验签失败 / 格式非法 / 算法不在白名单
@@ -42,6 +44,26 @@ func defaultErrors() Errors {
 		TokenInvalid: ErrTokenInvalid,
 		TokenExpired: ErrTokenExpired,
 	}
+}
+
+// normalizeErrors 给三个场景错误补上兜底错误码：普通错误（如 errors.New）不携带
+// gcode，Code() 为 CodeNil，gf 的 MiddlewareHandlerResponse 会把它替换为内部错误码
+// （码 50），出现"HTTP 401 + body code 50"的矛盾响应。包装后提示语与错误链
+// 原样保留（errors.Is 仍可匹配用户传入的原错误实例），仅补上缺失的 401 码。
+func normalizeErrors(e Errors) Errors {
+	e.TokenMissing = ensureCode(e.TokenMissing)
+	e.TokenInvalid = ensureCode(e.TokenInvalid)
+	e.TokenExpired = ensureCode(e.TokenExpired)
+	return e
+}
+
+// ensureCode 在错误未携带 gcode 时包一层 401 码。gcode 消息留空，
+// 保证 Error() 输出与原错误完全一致；WrapCode 保留 Unwrap 链。
+func ensureCode(err error) error {
+	if err == nil || gerror.Code(err) != gcode.CodeNil {
+		return err
+	}
+	return gerror.WrapCode(gcode.New(401, "", nil), err)
 }
 
 // config 是非泛型的配置结构，Option 操作它——
@@ -126,8 +148,7 @@ func WithRefreshClaims[C jwt.Claims](fn func(C) jwt.Claims) Option {
 
 // WithErrors 覆盖库的默认错误（逐字段生效），
 // 例如适配前端自定义错误码：gjwt.WithErrors(gjwt.Errors{TokenExpired: gerror.NewCode(gcode.New(10041, "", nil), "登录已过期")})
-// 注意：传入的错误必须用 gerror.NewCode 构造（详见 Errors 类型说明），
-// 传 errors.New 等普通错误会导致响应中间件输出内部错误码 50。
+// 传入普通错误（如 errors.New）同样可用：New 时自动补上 401 码，提示语与错误链不变（详见 Errors 类型说明）。
 func WithErrors(e Errors) Option {
 	return func(c *config) {
 		if e.TokenMissing != nil {
@@ -188,6 +209,12 @@ func New[C jwt.Claims](accessSecret string, newClaims func() C, opts ...Option) 
 	if newClaims == nil {
 		return nil, gerror.New("claims factory must not be nil")
 	}
+	// 工厂冒烟调用一次：返回 nil 实例的工厂（如 func() *MyClaims { return nil }）会让
+	// 每个请求都在反序列化处失败、统一报误导性的 token invalid；工厂内部的 panic
+	// 也借此暴露在启动阶段而非首个请求。
+	if err := probeClaimsFactory(newClaims); err != nil {
+		return nil, err
+	}
 	cfg := defaultConfig()
 	for _, opt := range opts {
 		opt(&cfg)
@@ -217,6 +244,9 @@ func New[C jwt.Claims](accessSecret string, newClaims func() C, opts ...Option) 
 			return nil, gerror.New("WithRefreshClaims: fn must be of type func(C) jwt.Claims matching this Auth instance")
 		}
 	}
+	// 错误实例统一补码：用户以 errors.New 等普通错误覆盖时不再触发
+	// gf 响应中间件的内部错误码改写（详见 normalizeErrors）
+	cfg.errors = normalizeErrors(cfg.errors)
 	a := &Auth[C]{
 		cfg:       cfg,
 		accessKey: []byte(accessSecret),
@@ -250,6 +280,28 @@ func validateSecret(secret string) error {
 	return nil
 }
 
+// probeClaimsFactory 调用一次工厂并校验返回非 nil 实例（原因见 New 中的注释）。
+func probeClaimsFactory[C jwt.Claims](newClaims func() C) error {
+	if isNilInstance(newClaims()) {
+		return gerror.New("claims factory must return a non-nil claims instance")
+	}
+	return nil
+}
+
+// isNilInstance 判断装箱后的值是否为 nil 或 nil 指针/切片/map 等空引用
+// （typed-nil 装箱进 any 后与 nil 比较恒为 false，须用 reflect 判断）。
+func isNilInstance(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Chan, reflect.Func, reflect.Slice, reflect.Interface:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
 // newParser 构建验签 Parser：算法白名单 + 时钟偏移容忍 + 注入时间源，
 // 配置了 issuer 时同步开启校验（否则该配置只写不验、形同虚设）。
 func (a *Auth[C]) newParser() *jwt.Parser {
@@ -259,6 +311,10 @@ func (a *Auth[C]) newParser() *jwt.Parser {
 		jwt.WithLeeway(a.cfg.leeway),
 		// 验签侧同样使用注入的时间源，WithTimeFunc 后签发/验签的时钟行为完全可控
 		jwt.WithTimeFunc(a.now),
+		// exp 必填：golang-jwt 默认不要求 exp 存在，无 exp 的 token 签名正确即永久有效。
+		// 本库签发的 token 恒有 exp，这道防线针对的是共享同一密钥的其他签发方
+		// （内部工具、手写签发代码）产出的无过期 token
+		jwt.WithExpirationRequired(),
 	}
 	if a.cfg.issuer != "" {
 		opts = append(opts, jwt.WithIssuer(a.cfg.issuer))
