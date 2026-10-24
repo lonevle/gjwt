@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/lonevle/gjwt/compare/v0.1.0...v0.2.0) (2026-10-24)
+
+
+### 🚀 Features
+
+* 增强文档和代码，添加 CORS 预检处理说明；优化错误处理，确保普通错误自动补码；新增测试用例验证缺失 exp 的 token 被拒绝 ([ca78239](https://github.com/lonevle/gjwt/commit/ca78239c34da535bb260868e40d433a9acb395aa))
+
 ## [0.1.0](https://github.com/lonevle/gjwt/compare/v0.0.1...v0.1.0) (2026-10-22)
 
 
